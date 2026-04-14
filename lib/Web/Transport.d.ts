@@ -16,7 +16,10 @@ export interface WsServer {
     isError: boolean;
 }
 export interface Configuration {
-    wsServers: Array<WsServer>;
+    wsServers: Array<WsServer> | (() => Promise<string | string[] | Array<{
+        wsUri: string;
+        weight?: number;
+    }>>);
     connectionTimeout: number;
     maxReconnectionAttempts: number;
     reconnectionTimeout: number;
@@ -30,6 +33,12 @@ export interface Configuration {
  */
 export declare class Transport extends TransportBase {
     static readonly C: typeof TransportStatus;
+    /**
+     * Helper function to format the wsServers parameter
+     * @param {any} wsServers
+     * @returns {Array<WsServer> | undefined}
+     */
+    private static formatWsServers;
     type: TypeStrings;
     server: WsServer;
     ws: any;
@@ -45,11 +54,16 @@ export declare class Transport extends TransportBase {
     private keepAliveDebounceTimeout;
     private status;
     private configuration;
+    private serverCheckResults;
     private boundOnOpen;
     private boundOnMessage;
     private boundOnClose;
     private boundOnError;
     constructor(logger: Logger, options?: any);
+    /**
+     * @returns {Array<WsServer>}
+     */
+    private readonly wsServers;
     /**
      * @returns {Boolean}
      */

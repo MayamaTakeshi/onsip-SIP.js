@@ -22,7 +22,7 @@ export interface WsServer {
 }
 
 export interface Configuration {
-  wsServers: Array<WsServer>;
+  wsServers: Array<WsServer> | (() => Promise<string | string[] | Array<{wsUri: string, weight?: number}>>);
   connectionTimeout: number;
   maxReconnectionAttempts: number;
   reconnectionTimeout: number;
@@ -47,8 +47,60 @@ const computeKeepAliveTimeout = (upperBound: number): number => {
  */
 export class Transport extends TransportBase {
   public static readonly C = TransportStatus;
+
+  /**
+   * Helper function to format the wsServers parameter
+   * @param {any} wsServers
+   * @returns {Array<WsServer> | undefined}
+   */
+  private static formatWsServers(wsServers: any): Array<WsServer> | undefined {
+    if (typeof wsServers === "string") {
+      wsServers = [{wsUri: wsServers}];
+    } else if (wsServers instanceof Array) {
+      for (let idx = 0; idx < wsServers.length; idx++) {
+        if (typeof wsServers[idx] === "string") {
+          wsServers[idx] = {wsUri: wsServers[idx]};
+        }
+      }
+    } else {
+      return;
+    }
+
+    if (wsServers.length === 0) {
+      return;
+    }
+
+    for (const wsServer of wsServers) {
+      if (!wsServer.wsUri) {
+        return;
+      }
+      if (wsServer.weight && !Number(wsServer.weight)) {
+        return;
+      }
+
+      const url: any | -1 = Grammar.parse(wsServer.wsUri, "absoluteURI");
+
+      if (url === -1) {
+        return;
+      } else if (["wss", "ws", "udp"].indexOf(url.scheme) < 0) {
+        return;
+      } else {
+        wsServer.sipUri = "<sip:" + url.host +
+          (url.port ? ":" + url.port : "") + ";transport=" + url.scheme.replace(/^wss$/i, "ws") + ";lr>";
+
+        if (!wsServer.weight) {
+          wsServer.weight = 0;
+        }
+
+        wsServer.isError = false;
+        wsServer.scheme = url.scheme.toUpperCase();
+      }
+    }
+    return wsServers;
+  }
+
   public type: TypeStrings;
-  public server: WsServer;
+  public server!: WsServer;
   public ws: any;
 
   private WebSocket = ((global as any).window || global).WebSocket;
@@ -69,6 +121,7 @@ export class Transport extends TransportBase {
 
   private status: TransportStatus;
   private configuration: Configuration;
+  private serverCheckResults: Array<WsServer> | undefined;
   private boundOnOpen: any;
   private boundOnMessage: any;
   private boundOnClose: any;
@@ -81,7 +134,22 @@ export class Transport extends TransportBase {
     this.reconnectionAttempts = 0;
     this.status = TransportStatus.STATUS_CONNECTING;
     this.configuration = this.loadConfig(options);
-    this.server = this.configuration.wsServers[0];
+    if (this.configuration.wsServers instanceof Array) {
+      this.server = this.configuration.wsServers[0];
+    }
+  }
+
+  /**
+   * @returns {Array<WsServer>}
+   */
+  private get wsServers(): Array<WsServer> {
+    if (this.serverCheckResults) {
+      return this.serverCheckResults;
+    }
+    if (this.configuration.wsServers instanceof Array) {
+      return this.configuration.wsServers;
+    }
+    return [];
   }
 
   /**
@@ -164,60 +232,72 @@ export class Transport extends TransportBase {
    */
   protected connectPromise(options: any = {}) {
     if (this.status === TransportStatus.STATUS_CLOSING && !options.force) {
-      return Promise.reject("WebSocket " + this.server.wsUri + " is closing");
+      return Promise.reject("WebSocket " + (this.server ? this.server.wsUri : "unknown") + " is closing");
     }
     if (this.connectionPromise) {
       return this.connectionPromise;
     }
-    this.server = this.server || this.getNextWsServer(options.force);
 
-    this.connectionPromise = new Promise((resolve, reject) => {
-      if ((this.status === TransportStatus.STATUS_OPEN || this.status === TransportStatus.STATUS_CLOSING)
-        && !options.force) {
-        this.logger.warn("WebSocket " + this.server.wsUri + " is already connected");
-        reject("Failed status check - attempted to open a connection but already open/closing");
-        return;
-      }
+    const promise = typeof this.configuration.wsServers === "function" ?
+      this.configuration.wsServers().then((servers) => {
+        this.serverCheckResults = Transport.formatWsServers(servers);
+        if (!this.serverCheckResults) {
+          throw new Error("Invalid wsServers returned from function");
+        }
+      }) :
+      Promise.resolve();
 
-      this.connectDeferredResolve = resolve;
+    this.connectionPromise = promise.then(() => {
+      this.server = this.server || this.getNextWsServer(options.force);
 
-      this.status = TransportStatus.STATUS_CONNECTING;
-      this.emit("connecting");
-      this.logger.log("connecting to WebSocket " + this.server.wsUri);
-      this.disposeWs();
-      try {
-        this.ws = new WebSocket(this.server.wsUri, "sip");
-      } catch (e) {
-        this.ws = null;
-        this.status = TransportStatus.STATUS_CLOSED; // force status to closed in error case
-        this.onError("error connecting to WebSocket " + this.server.wsUri + ":" + e);
-        reject("Failed to create a websocket");
-        return;
-      }
+      return new Promise((resolve, reject) => {
+        if ((this.status === TransportStatus.STATUS_OPEN || this.status === TransportStatus.STATUS_CLOSING)
+          && !options.force) {
+          this.logger.warn("WebSocket " + this.server.wsUri + " is already connected");
+          reject("Failed status check - attempted to open a connection but already open/closing");
+          return;
+        }
 
-      if (!this.ws) {
-        reject("Unexpected instance websocket not set");
-        return;
-      }
+        this.connectDeferredResolve = resolve;
 
-      this.connectionTimeout = setTimeout(() => {
-        this.statusTransition(TransportStatus.STATUS_CLOSED);
-        this.logger.warn("took too long to connect - exceeded time set in configuration.connectionTimeout: " +
-          this.configuration.connectionTimeout + "s");
-        this.emit("disconnected", {code: 1000});
-        this.connectionPromise = undefined;
-        reject("Connection timeout");
-      }, this.configuration.connectionTimeout * 1000);
+        this.status = TransportStatus.STATUS_CONNECTING;
+        this.emit("connecting");
+        this.logger.log("connecting to WebSocket " + this.server.wsUri);
+        this.disposeWs();
+        try {
+          this.ws = new WebSocket(this.server.wsUri, "sip");
+        } catch (e) {
+          this.ws = null;
+          this.status = TransportStatus.STATUS_CLOSED; // force status to closed in error case
+          this.onError("error connecting to WebSocket " + this.server.wsUri + ":" + e);
+          reject("Failed to create a websocket");
+          return;
+        }
 
-      this.boundOnOpen = this.onOpen.bind(this);
-      this.boundOnMessage = this.onMessage.bind(this);
-      this.boundOnClose = this.onClose.bind(this);
-      this.boundOnError = this.onWebsocketError.bind(this);
+        if (!this.ws) {
+          reject("Unexpected instance websocket not set");
+          return;
+        }
 
-      this.ws.addEventListener("open", this.boundOnOpen);
-      this.ws.addEventListener("message", this.boundOnMessage);
-      this.ws.addEventListener("close", this.boundOnClose);
-      this.ws.addEventListener("error", this.boundOnError);
+        this.connectionTimeout = setTimeout(() => {
+          this.statusTransition(TransportStatus.STATUS_CLOSED);
+          this.logger.warn("took too long to connect - exceeded time set in configuration.connectionTimeout: " +
+            this.configuration.connectionTimeout + "s");
+          this.emit("disconnected", {code: 1000});
+          this.connectionPromise = undefined;
+          reject("Connection timeout");
+        }, this.configuration.connectionTimeout * 1000);
+
+        this.boundOnOpen = this.onOpen.bind(this);
+        this.boundOnMessage = this.onMessage.bind(this);
+        this.boundOnClose = this.onClose.bind(this);
+        this.boundOnError = this.onWebsocketError.bind(this);
+
+        this.ws.addEventListener("open", this.boundOnOpen);
+        this.ws.addEventListener("message", this.boundOnMessage);
+        this.ws.addEventListener("close", this.boundOnClose);
+        this.ws.addEventListener("error", this.boundOnError);
+      });
     });
 
     return this.connectionPromise;
@@ -422,7 +502,7 @@ export class Transport extends TransportBase {
    * Resets the error state of all servers in the configuration
    */
   private resetServerErrorStatus(): void {
-    for (const websocket of this.configuration.wsServers) {
+    for (const websocket of this.wsServers) {
       websocket.isError = false;
     }
   }
@@ -440,7 +520,7 @@ export class Transport extends TransportBase {
     // Order servers by weight
     let candidates: Array<WsServer> = [];
 
-    for (const wsServer of this.configuration.wsServers) {
+    for (const wsServer of this.wsServers) {
       if (wsServer.isError && !force) {
         continue;
       } else if (candidates.length === 0) {
@@ -461,7 +541,7 @@ export class Transport extends TransportBase {
    * @returns {Boolean}
    */
   private noAvailableServers(): boolean {
-    for (const server of this.configuration.wsServers) {
+    for (const server of this.wsServers) {
       if (!server.isError) {
         return false;
       }
@@ -678,55 +758,14 @@ export class Transport extends TransportBase {
 
         // Note: this function used to call 'this.logger.error' but calling 'this' with anything here is invalid
         wsServers: (wsServers: any): any => {
-          /* Allow defining wsServers parameter as:
-           *  String: "host"
-           *  Array of Strings: ["host1", "host2"]
-           *  Array of Objects: [{wsUri:"host1", weight:1}, {wsUri:"host2", weight:0}]
-           *  Array of Objects and Strings: [{wsUri:"host1"}, "host2"]
-           */
-          if (typeof wsServers === "string") {
-            wsServers = [{wsUri: wsServers}];
-          } else if (wsServers instanceof Array) {
-            for (let idx = 0; idx < wsServers.length; idx++) {
-              if (typeof wsServers[idx] === "string") {
-                wsServers[idx] = {wsUri: wsServers[idx]};
-              }
-            }
-          } else {
-            return;
+          if (typeof wsServers === "function") {
+            return wsServers;
           }
-
-          if (wsServers.length === 0) {
-            return false;
+          const formattedWsServers = Transport.formatWsServers(wsServers);
+          if (!formattedWsServers) {
+            return wsServers.length === 0 ? false : undefined;
           }
-
-          for (const wsServer of wsServers) {
-            if (!wsServer.wsUri) {
-              return;
-            }
-            if (wsServer.weight && !Number(wsServer.weight)) {
-              return;
-            }
-
-            const url: any | -1 = Grammar.parse(wsServer.wsUri, "absoluteURI");
-
-            if (url === -1) {
-              return;
-            } else if (["wss", "ws", "udp"].indexOf(url.scheme) < 0) {
-              return;
-            } else {
-              wsServer.sipUri = "<sip:" + url.host +
-                (url.port ? ":" + url.port : "") + ";transport=" + url.scheme.replace(/^wss$/i, "ws") + ";lr>";
-
-              if (!wsServer.weight) {
-                wsServer.weight = 0;
-              }
-
-              wsServer.isError = false;
-              wsServer.scheme = url.scheme.toUpperCase();
-            }
-          }
-          return wsServers;
+          return formattedWsServers;
         },
 
         keepAliveInterval: (keepAliveInterval: string): number | undefined => {
